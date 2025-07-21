@@ -3,7 +3,6 @@
 #include <assert.h>
 
 #include <openssl/bn.h>
-#include <openssl/crypto.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -12,7 +11,6 @@
 
 #include "attrs.h"
 #include "log.h"
-#include "pkcs11.h"
 #include "ssl_util.h"
 #include "twist.h"
 
@@ -418,8 +416,74 @@ CK_RV ssl_util_attrs_to_evp(attr_list *attrs, EVP_PKEY **outpkey) {
     return CKR_OK;
 }
 
+CK_RV ssl_util_decrypt(EVP_PKEY *pkey,
+        int padding,
+        CK_BYTE_PTR ctext, CK_ULONG ctextlen,
+        CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen) {
+
+    assert(pkey);
+
+    CK_RV rv = CKR_GENERAL_ERROR;
+
+    int to_len = EVP_PKEY_size(pkey);
+    if (to_len <= 0) {
+        LOGE("Expected buffer size to be > 0, got: %d", to_len);
+        return CKR_GENERAL_ERROR;
+    }
+
+    EVP_PKEY_CTX *pkey_ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (!pkey_ctx) {
+        LOGE("OOM");
+        return CKR_HOST_MEMORY;
+    }
+
+    int rc = EVP_PKEY_decrypt_init(pkey_ctx);
+    if (rc <= 0) {
+        SSL_UTIL_LOGE("EVP_PKEY_encrypt_init");
+        goto out;
+    }
+
+    if (padding) {
+        int rc = EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding);
+        if (rc <= 0) {
+            SSL_UTIL_LOGE("Could not set padding");
+            goto out;
+        }
+    }
+
+    unsigned char *buffer = calloc(1, to_len);
+    if (!buffer) {
+        LOGE("oom");
+        rv = CKR_HOST_MEMORY;
+        goto out;
+    }
+
+    size_t out_len = to_len;
+    rc = EVP_PKEY_decrypt(pkey_ctx, buffer, &out_len, ctext, ctextlen);
+    if (rc <= 0) {
+        SSL_UTIL_LOGE("Could not perform EVP_PKEY_decrypt");
+        goto out;
+    }
+
+    if (*ptextlen > (CK_ULONG)out_len) {
+        *ptextlen = out_len;
+        free(buffer);
+        return CKR_BUFFER_TOO_SMALL;
+    }
+
+    memcpy(ptext, buffer, to_len);
+    *ptextlen = to_len;
+
+    rv = CKR_OK;
+
+out:
+    EVP_PKEY_CTX_free(pkey_ctx);
+    free(buffer);
+    return rv;
+}
+
 CK_RV ssl_util_encrypt(EVP_PKEY *pkey,
-        int padding, twist label, const EVP_MD *md,
+        int padding,
         CK_BYTE_PTR ptext, CK_ULONG ptextlen,
         CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen) {
 
@@ -448,34 +512,6 @@ CK_RV ssl_util_encrypt(EVP_PKEY *pkey,
         rc = EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding);
         if (rc <= 0) {
             SSL_UTIL_LOGE("Could not set padding");
-            goto error;
-        }
-    }
-
-    if (label) {
-        assert(padding == RSA_PKCS1_OAEP_PADDING);
-
-        /* make a copy since OSSL calls OSSL_free on label */
-        size_t len = twist_len(label);
-        char *label2 = OPENSSL_memdup(label, len);
-        if (!label2) {
-            LOGE("oom");
-            return CKR_HOST_MEMORY;
-        }
-
-        rc = EVP_PKEY_CTX_set0_rsa_oaep_label(pkey_ctx,
-                label2, len);
-        if (rc <= 0) {
-            SSL_UTIL_LOGE("EVP_PKEY_CTX_set0_rsa_oaep_label");
-            goto error;
-        }
-    }
-
-    if (md) {
-        assert(padding == RSA_PKCS1_OAEP_PADDING);
-        rc = EVP_PKEY_CTX_set_rsa_oaep_md(pkey_ctx, md);
-        if (rc <= 0) {
-            SSL_UTIL_LOGE("EVP_PKEY_CTX_set_rsa_oaep_md");
             goto error;
         }
     }

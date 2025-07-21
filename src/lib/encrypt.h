@@ -8,7 +8,6 @@
 #include "mech.h"
 #include "pkcs11.h"
 #include "tpm.h"
-#include "twist.h"
 
 typedef struct token token;
 
@@ -23,17 +22,16 @@ union crypto_op_data{
 
 struct encrypt_op_data {
     bool use_sw;
+    CK_OBJECT_CLASS clazz;
     crypto_op_data cryptopdata;
 };
 
 struct sw_encrypt_data {
     int padding;
-    twist label;
-    const EVP_MD *md;
     EVP_PKEY *key;
 };
 
-encrypt_op_data *encrypt_op_data_new(void);
+encrypt_op_data *encrypt_op_data_new(tobject *tobj);
 void encrypt_op_data_free(encrypt_op_data **opdata);
 
 CK_RV sw_encrypt_data_init(mdetail *mdtl,

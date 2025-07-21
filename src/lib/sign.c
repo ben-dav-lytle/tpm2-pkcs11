@@ -237,7 +237,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
     memcpy(&opdata->mech, mechanism, sizeof(opdata->mech));
     opdata->digest_opdata = digest_opdata;
 
-    opdata->crypto_opdata = encrypt_op_data_new();
+    opdata->crypto_opdata = encrypt_op_data_new(tobj);
     if (!opdata->crypto_opdata) {
         sign_opdata_free(&opdata);
         return CKR_HOST_MEMORY;
@@ -420,7 +420,7 @@ CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signat
     if (is_synthetic) {
 
         /* sign padded pkcs 1.5 structure */
-        encrypt_op_data *encrypt_opdata = encrypt_op_data_new();
+        encrypt_op_data *encrypt_opdata = encrypt_op_data_new(tobj);
         if (!encrypt_opdata) {
             rv = CKR_HOST_MEMORY;
             goto session_out;

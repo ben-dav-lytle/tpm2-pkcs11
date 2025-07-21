@@ -15,9 +15,8 @@
 #include "session_ctx.h"
 #include "token.h"
 #include "tpm.h"
-#include "twist.h"
 
-typedef CK_RV (*crypto_op)(crypto_op_data *enc_data, CK_BYTE_PTR in, CK_ULONG inlen, CK_BYTE_PTR out, CK_ULONG_PTR outlen);
+typedef CK_RV (*crypto_op)(crypto_op_data *enc_data, CK_OBJECT_CLASS, CK_BYTE_PTR in, CK_ULONG inlen, CK_BYTE_PTR out, CK_ULONG_PTR outlen);
 
 static sw_encrypt_data *sw_encrypt_data_new(void) {
 
@@ -25,8 +24,7 @@ static sw_encrypt_data *sw_encrypt_data_new(void) {
 }
 
 static void sw_encrypt_data_free(sw_encrypt_data **enc_data) {
-
-    if (!enc_data || !*enc_data) {
+    if (!enc_data) {
         return;
     }
 
@@ -34,15 +32,33 @@ static void sw_encrypt_data_free(sw_encrypt_data **enc_data) {
         EVP_PKEY_free((*enc_data)->key);
     }
 
-    twist_free((*enc_data)->label);
-
     free(*enc_data);
     *enc_data = NULL;
 }
 
-encrypt_op_data *encrypt_op_data_new(void) {
+encrypt_op_data *encrypt_op_data_new(tobject *tobj) {
 
-    return (encrypt_op_data *)calloc(1, sizeof(encrypt_op_data));
+    CK_ATTRIBUTE_PTR a = attr_get_attribute_by_type(tobj->attrs, CKA_CLASS);
+    if (!a) {
+        LOGE("Expected tobjects to have attribute CKA_CLASS");
+        return NULL;
+    }
+
+    CK_OBJECT_CLASS clazz;
+    CK_RV rv = attr_CK_OBJECT_CLASS(a, &clazz);
+    if (rv != CKR_OK) {
+        LOGE("Could not convert CKA_CLASS");
+        return NULL;
+    }
+
+    encrypt_op_data *d = (encrypt_op_data *)calloc(1, sizeof(encrypt_op_data));
+    if (!d) {
+        return NULL;
+    }
+
+    d->clazz = clazz;
+
+    return d;
 }
 
 void encrypt_op_data_free(encrypt_op_data **opdata) {
@@ -70,50 +86,25 @@ CK_RV sw_encrypt_data_init(mdetail *mdtl, CK_MECHANISM *mechanism, tobject *tobj
         return rv;
     }
 
-    const EVP_MD *md = NULL;
-    bool is_hashing_needed = false;
-    rv = mech_is_hashing_needed(
-            mdtl,
-            mechanism,
-            &is_hashing_needed);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-
-    if (is_hashing_needed) {
-        rv = mech_get_digester(mdtl, mechanism, &md);
-        if (rv != CKR_OK) {
-            return rv;
-        }
-    }
-
-    twist label = NULL;
-    rv = mech_get_label(mechanism, &label);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-
     sw_encrypt_data *d = sw_encrypt_data_new();
     if (!d) {
         LOGE("oom");
-        twist_free(label);
         EVP_PKEY_free(pkey);
         return CKR_HOST_MEMORY;
     }
 
     d->key = pkey;
     d->padding = padding;
-    d->label = label;
-    d->md = md;
 
     *enc_data = d;
 
     return CKR_OK;
 }
 
-static CK_RV sw_encrypt(crypto_op_data *opdata,
+static CK_RV sw_encrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz,
         CK_BYTE_PTR ptext, CK_ULONG ptextlen,
         CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen) {
+    UNUSED(clazz);
     assert(opdata);
 
     sw_encrypt_data *sw_enc_data = opdata->sw_enc_data;
@@ -123,10 +114,25 @@ static CK_RV sw_encrypt(crypto_op_data *opdata,
 
     return ssl_util_encrypt(sw_enc_data->key,
             sw_enc_data->padding,
-            sw_enc_data->label,
-            sw_enc_data->md,
             ptext, ptextlen,
             ctext, ctextlen);
+}
+
+static CK_RV sw_decrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz,
+        CK_BYTE_PTR ctext, CK_ULONG ctextlen,
+        CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen) {
+    UNUSED(clazz);
+    assert(opdata);
+
+    sw_encrypt_data *sw_enc_data = opdata->sw_enc_data;
+
+    assert(sw_enc_data);
+    assert(sw_enc_data->key);
+
+    return ssl_util_decrypt(sw_enc_data->key,
+            sw_enc_data->padding,
+            ctext, ctextlen,
+            ptext, ptextlen);
 }
 
 static CK_RV common_init_op (session_ctx *ctx, encrypt_op_data *supplied_opdata, operation op, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
@@ -162,22 +168,9 @@ static CK_RV common_init_op (session_ctx *ctx, encrypt_op_data *supplied_opdata,
         return rv;
     }
 
-    CK_ATTRIBUTE_PTR a = attr_get_attribute_by_type(tobj->attrs, CKA_CLASS);
-    if (!a) {
-        LOGE("Expected tobject to have attribute CKA_CLASS");
-        return CKR_GENERAL_ERROR;
-    }
-
-    CK_OBJECT_CLASS obj_class = 0;
-    rv = attr_CK_OBJECT_CLASS(a, &obj_class);
-    if (rv != CKR_OK) {
-        LOGE("Could not convert CKA_CLASS");
-        return rv;
-    }
-
     encrypt_op_data *opdata;
     if (!supplied_opdata) {
-        opdata = encrypt_op_data_new();
+        opdata = encrypt_op_data_new(tobj);
         if (!opdata) {
             tobject_user_decrement(tobj);
             return CKR_HOST_MEMORY;
@@ -187,15 +180,15 @@ static CK_RV common_init_op (session_ctx *ctx, encrypt_op_data *supplied_opdata,
     }
 
     /*
-     * Public Key Objects don't need to hit the TPM
+     * Objects that don't have a tpm pub pointer blob are things like public key
+     * only object and don't go to the TPM.
      */
-    if (obj_class == CKO_PUBLIC_KEY) {
-        opdata->use_sw = true;
-        rv = sw_encrypt_data_init(tok->mdtl, mechanism, tobj, &opdata->cryptopdata.sw_enc_data);
-    } else {
-        rv = mech_get_tpm_opdata(tok->mdtl,
-                tok->tctx, mechanism, tobj,
+    if (tobj->pub) {
+        rv = mech_get_tpm_opdata(tok->tctx, mechanism, tobj,
                 &opdata->cryptopdata.tpm_opdata);
+    } else {
+        opdata->use_sw = true;
+        rv = sw_encrypt_data_init(mechanism, tobj, &opdata->cryptopdata.sw_enc_data);
     }
 
     if (rv != CKR_OK) {
@@ -237,29 +230,19 @@ static CK_RV common_update_op (session_ctx *ctx, encrypt_op_data *supplied_opdat
         opdata = supplied_opdata;
     }
 
-    /*
-     * Public key crypto operations have the use_sw flag set. Currently,
-     * they are restricted to working only with RSA AFAIK. Thus,
-     * they only perform RSA Encrypt (RSA operation w/pub key). Thus, the
-     * SW path will always call sw_encrypt.
-     *
-     * If we add proper EC support, we likely need a sw_decrypt interface
-     * that does the right thing with respect to EC and RSA. For RSA it
-     * should always call Encrypt and for EC, likely can do Encrypt.
-     */
     crypto_op fop;
     switch(op) {
     case operation_encrypt:
         fop = opdata->use_sw ? sw_encrypt : tpm_encrypt;
         break;
     case operation_decrypt:
-        fop = opdata->use_sw ? sw_encrypt : tpm_decrypt;
+        fop = opdata->use_sw ? sw_decrypt : tpm_decrypt;
         break;
     default:
         return CKR_GENERAL_ERROR;
     }
 
-    return fop(&opdata->cryptopdata, part, part_len,
+    rv = fop(&opdata->cryptopdata, opdata->clazz, part, part_len,
             encrypted_part, encrypted_part_len);
 }
 

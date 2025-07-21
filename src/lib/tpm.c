@@ -2277,10 +2277,74 @@ out:
     return rv;
 }
 
-static TSS2_RC tpm_get_cc(tpm_ctx *tpm, TPMS_CAPABILITY_DATA **capabilityData) {
-    assert(tpm);
-    assert(tpm->esys_ctx);
-    assert(capabilityData);
+CK_RV tpm_rsa_encrypt(tpm_op_data *tpm_enc_data,
+        CK_BYTE_PTR pptext, CK_ULONG pptextlen,
+        CK_BYTE_PTR cctext, CK_ULONG_PTR cctextlen) {
+
+    LOGV("Performing TPM RSA Encrypt");
+
+    CK_RV rv = CKR_GENERAL_ERROR;
+
+    tpm_ctx *ctx = tpm_enc_data->ctx;
+
+    TPMT_RSA_DECRYPT *scheme = &tpm_enc_data->rsa.raw;
+    TPM2B_DATA *label = &tpm_enc_data->rsa.label;
+
+    /*
+     * Validate that plaintext data fits in a message buffer.
+     * Do this first since it requires no trip to the TPM
+     * to verify or memory allocation.
+     */
+    TPM2B_PUBLIC_KEY_RSA message = { .size = pptextlen };
+    if (pptextlen > sizeof(message.buffer)) {
+        return CKR_ARGUMENTS_BAD;
+    }
+    memcpy(message.buffer, pptext, pptextlen);
+
+    ESYS_TR handle = tpm_enc_data->tobj->tpm_handle;
+
+    TPM2B_PUBLIC_KEY_RSA *ctext;
+
+    TSS2_RC rc = Esys_RSA_Encrypt(
+            ctx->esys_ctx,
+            handle,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            &message,
+            scheme,
+            label,
+            &ctext);
+    if (rc != TPM2_RC_SUCCESS) {
+        LOGE("Esys_RSA_Encrypt: %s", Tss2_RC_Decode(rc));
+        return CKR_GENERAL_ERROR;
+    }
+
+    if (!cctext) {
+        *cctextlen = ctext->size;
+        rv = CKR_OK;
+        goto out;
+    }
+
+    if (*cctextlen < ctext->size) {
+        *cctextlen = ctext->size;
+        rv = CKR_BUFFER_TOO_SMALL;
+        goto out;
+    }
+
+    *cctextlen = ctext->size;
+    memcpy(cctext, ctext->buffer, ctext->size);
+
+    rv = CKR_OK;
+
+out:
+    free(ctext);
+
+    return rv;
+}
+
+static CK_RV encrypt_decrypt(tpm_ctx *ctx, uint32_t handle, twist objauth, TPMI_ALG_SYM_MODE mode, TPMI_YES_NO is_decrypt,
+        TPM2B_IV *iv, CK_BYTE_PTR data_in, CK_ULONG data_in_len, CK_BYTE_PTR data_out, CK_ULONG_PTR data_out_len) {
 
     if (tpm->tpms_cc_cache) {
         *capabilityData = tpm->tpms_cc_cache;
@@ -2480,130 +2544,15 @@ static CK_RV encrypt_decrypt(tpm_ctx *ctx, uint32_t handle, twist objauth, TPMI_
 #define ENCRYPT 0
 #define DECRYPT 1
 
-static CK_RV do_buffered_encdec(tpm_op_data *tpm_enc_data,
-        int encdec,
-        CK_BYTE_PTR in, CK_ULONG inlen,
-        CK_BYTE_PTR out, CK_ULONG_PTR outlen) {
-
-    CK_RV rv = CKR_GENERAL_ERROR;
-
-    tpm_ctx *ctx = tpm_enc_data->ctx;
-    TPMI_ALG_SYM_MODE mode = tpm_enc_data->sym.mode;
-    TPM2B_IV *iv = &tpm_enc_data->sym.iv;
-
-    twist auth = tpm_enc_data->tobj->unsealed_auth;
-    ESYS_TR handle = tpm_enc_data->tobj->tpm_esys_tr;
-
-    /* final calls don't have input data, they just exhaust the internal buffer if present */
-    bool is_final = !in;
-
-    /*
-     * if the application doesn't ask for a block boundary,
-     * buffer the extra till later when you can make a block.
-     * Manipulate the input to the TPM to be on a boundary.
-     */
-    binarybuffer data[] = {
-        { .data = tpm_enc_data->sym.prev.data, .size = tpm_enc_data->sym.prev.len },
-        { .data = in,                          .size = inlen                      },
-    };
-
-    twist full_buffer = twistbin_create(data, ARRAY_LEN(data));
-    if (!full_buffer) {
-        LOGE("oom");
-        return CKR_HOST_MEMORY;
-    }
-
-    /* pass only the "good blocks here */
-    size_t full_buffer_len = twist_len(full_buffer);
-    CK_ULONG extralen = full_buffer_len % 16;
-    CK_ULONG blocks = full_buffer_len / 16;
-    CK_ULONG modified_full_buffer_len = full_buffer_len - extralen;
-
-    /*
-     * Hold a block back on the following conditions:
-     * 1. Decrypt, as one block will have padding. Encrypt can just fire off blocks like
-     *    normal. Decrypt will need a final block to strip padding from.
-     * 2. Its not the final round, the final round better be right or error.
-     * 3. There are blocks to hold back
-     * 4. There is NO extra data, just send the blocks we have.
-     *    the blocks we have.
-     * 5. We have a padding mechanism, so we need to hold it back for possible final pad.
-     */
-    bool hold_block_back = encdec == DECRYPT
-            && !is_final
-            && blocks > 0
-            && extralen == 0
-            && tpm_enc_data->mech.mechanism == CKM_AES_CBC_PAD;
-
-    if (hold_block_back) {
-        blocks--;
-        extralen = blocks == 0 ? 16 : blocks * 16;
-        modified_full_buffer_len = blocks * 16;
-    }
-
-    if (blocks) {
-
-        if (tpm_enc_data->mech.mechanism == CKM_AES_CTR) {
-
-            /* Detect CTR wrapping, ie CTR should never repeat itself */
-            int rc = BN_add_word(tpm_enc_data->sym.ctr.counter, blocks);
-            if (!rc) {
-                SSL_UTIL_LOGE("BN_add_word");
-                rv = CKR_GENERAL_ERROR;
-                goto error;
-            }
-
-            /* it shouldn't be over 16 bytes */
-            int bytes = BN_num_bytes(tpm_enc_data->sym.ctr.counter);
-            assert(bytes >= 0);
-            if ((unsigned)bytes > sizeof(((CK_AES_CTR_PARAMS *)NULL)->cb)) {
-                LOGE("CTR counter wrapped");
-                rv = CKR_DATA_LEN_RANGE;
-                goto error;
-            }
-        }
-
-        rv = encrypt_decrypt(ctx, handle, auth, mode, encdec,
-                iv,
-                (CK_BYTE_PTR)full_buffer, modified_full_buffer_len,
-                out, outlen);
-        if (rv != CKR_OK) {
-            goto error;
-        }
-    } else {
-        /* no blocks to encrypt, nothing to output */
-        *outlen = 0;
-    }
-
-    /* if we have extra data, save it for next round */
-    /* make sure we don't exceed the space of the internal static buffer */
-    if (extralen > sizeof(tpm_enc_data->sym.prev.data)) {
-        LOGE("Internal buffer too small");
-        rv = CKR_GENERAL_ERROR;
-        goto error;
-    }
-
-    tpm_enc_data->sym.prev.len = extralen;
-    if (extralen) {
-        memcpy(tpm_enc_data->sym.prev.data, &full_buffer[modified_full_buffer_len], extralen);
-    }
-
-    rv = CKR_OK;
-
-error:
-    twist_free(full_buffer);
-
-    return rv;
-}
-
-CK_RV tpm_encrypt(crypto_op_data *opdata,
+CK_RV tpm_encrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz,
         CK_BYTE_PTR ptext, CK_ULONG ptextlen,
         CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen) {
 
     tpm_op_data *tpm_enc_data = opdata->tpm_opdata;
 
     if (tpm_enc_data->op_type == CKK_RSA) {
-        return tpm_rsa_decrypt(tpm_enc_data, ptext, ptextlen, ctext, ctextlen);
+        return clazz == CKO_PRIVATE_KEY ? tpm_rsa_decrypt(tpm_enc_data, ptext, ptextlen, ctext, ctextlen) :
+                tpm_rsa_encrypt(tpm_enc_data, ptext, ptextlen, ctext, ctextlen);
     }
 
     return do_buffered_encdec(tpm_enc_data, ENCRYPT, ptext, ptextlen,
@@ -2735,26 +2684,16 @@ CK_RV tpm_final_encrypt(crypto_op_data *opdata,
     return common_final_encrypt_decrypt(ENCRYPT, opdata, last_part, last_part_len);
 }
 
-CK_RV tpm_decrypt(crypto_op_data *opdata,
+CK_RV tpm_decrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz,
         CK_BYTE_PTR ctext, CK_ULONG ctextlen,
         CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen) {
 
     tpm_op_data *tpm_enc_data = opdata->tpm_opdata;
 
     if (tpm_enc_data->op_type == CKK_RSA) {
-        CK_BYTE buf[4096];
-        CK_ULONG buf_len = sizeof(buf);
-
-        CK_RV rv = tpm_rsa_decrypt(tpm_enc_data, ctext, ctextlen, buf, &buf_len);
-        if (rv != CKR_OK) {
-            return rv;
-        }
-
-        return mech_unsynthesize(
-                tpm_enc_data->mdtl,
-                &tpm_enc_data->mech, tpm_enc_data->tobj->attrs,
-                buf, buf_len,
-                ptext, ptextlen);
+        LOGV("tpm_encrypt object class: %lu", clazz);
+        return clazz == CKO_PRIVATE_KEY ? tpm_rsa_decrypt(tpm_enc_data, ctext, ctextlen, ptext, ptextlen) :
+                tpm_rsa_encrypt(tpm_enc_data, ctext, ctextlen, ptext, ptextlen);
     }
 
     return do_buffered_encdec(tpm_enc_data, DECRYPT,

@@ -137,11 +137,9 @@ CK_RV tpm_hmac_sha512_get_opdata(mdetail *mdtl, tpm_ctx *tctx, CK_MECHANISM_PTR 
 void tpm_opdata_reset(tpm_op_data *opdata);
 void tpm_opdata_free(tpm_op_data **opdata);
 
-CK_RV tpm_encrypt(crypto_op_data *opdata, CK_BYTE_PTR ptext, CK_ULONG ptextlen, CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen);
+CK_RV tpm_encrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz, CK_BYTE_PTR ptext, CK_ULONG ptextlen, CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen);
 
-CK_RV tpm_final_encrypt(crypto_op_data *opdata, CK_BYTE_PTR last_part, CK_ULONG_PTR last_part_len);
-
-CK_RV tpm_decrypt(crypto_op_data *opdata, CK_BYTE_PTR ctext, CK_ULONG ctextlen, CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen);
+CK_RV tpm_decrypt(crypto_op_data *opdata, CK_OBJECT_CLASS clazz, CK_BYTE_PTR ctext, CK_ULONG ctextlen, CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen);
 
 CK_RV tpm_final_decrypt(crypto_op_data *opdata, CK_BYTE_PTR last_part, CK_ULONG_PTR last_part_len);
 

@@ -31,8 +31,13 @@
 
 CK_RV ssl_util_attrs_to_evp(attr_list *attrs, EVP_PKEY **outpkey);
 
+CK_RV ssl_util_decrypt(EVP_PKEY *pkey,
+        int padding,
+        CK_BYTE_PTR ctext, CK_ULONG ctextlen,
+        CK_BYTE_PTR ptext, CK_ULONG_PTR ptextlen);
+
 CK_RV ssl_util_encrypt(EVP_PKEY *pkey,
-        int padding, twist label, const EVP_MD *md,
+        int padding,
         CK_BYTE_PTR ptext, CK_ULONG ptextlen,
         CK_BYTE_PTR ctext, CK_ULONG_PTR ctextlen);
 

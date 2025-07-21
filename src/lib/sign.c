@@ -4,11 +4,6 @@
 #include <assert.h>
 #include <stdlib.h>
 
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/evp.h>
- #include <openssl/rsa.h>
-
 #include "attrs.h"
 #include "backend.h"
 #include "checks.h"
@@ -16,7 +11,6 @@
 #include "encrypt.h"
 #include "log.h"
 #include "mech.h"
-#include "ssl_util.h"
 #include "session.h"
 #include "session_ctx.h"
 #include "sign.h"
@@ -30,10 +24,6 @@ struct sign_opdata {
     twist buffer;
     digest_op_data *digest_opdata;
     encrypt_op_data *crypto_opdata;
-
-    int padding;
-    EVP_PKEY *pkey;
-    const EVP_MD *md;
 };
 
 static sign_opdata *sign_opdata_new(mdetail *mdtl, CK_MECHANISM_PTR mechanism, tobject *tobj) {
@@ -96,10 +86,6 @@ static void sign_opdata_free(sign_opdata **opdata) {
 
     if (*opdata && !(*opdata)->do_hash) {
         twist_free((*opdata)->buffer);
-    }
-
-    if ((*opdata)->pkey) {
-        EVP_PKEY_free((*opdata)->pkey);
     }
 
     if ((*opdata)->crypto_opdata) {
@@ -199,35 +185,14 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
         }
     }
 
-    /* TPM is only used on sign operations, not verify. This is because
-     * with asymmetric key pairs we can use the public key for verification in SW
-     * without needing to involve the TPM. This with HMAC we need to use the TPM
-     * verify since the key is only resident in the TPM.
-     */
-    bool is_hmac = false;
-    rv = mech_is_HMAC(tok->mdtl, mechanism, &is_hmac);
+    tpm_op_data *tpm_opdata;
+    rv = mech_get_tpm_opdata(tok->tctx, mechanism, tobj, &tpm_opdata);
     if (rv != CKR_OK) {
-        LOGE("Could not determine if algorithm is HMAC or not");
+        tpm_opdata_free(&tpm_opdata);
         return rv;
     }
 
-    tpm_op_data *tpm_opdata = NULL;
-    if (op == operation_sign || is_hmac) {
-
-        rv = update_pss_sig_state(tok, tobj);
-        if (rv != CKR_OK) {
-            return rv;
-        }
-
-        rv = mech_get_tpm_opdata(tok->mdtl,
-                tok->tctx, mechanism, tobj, &tpm_opdata);
-        if (rv != CKR_OK) {
-            return rv;
-        }
-    }
-
-    sign_opdata *opdata = sign_opdata_new(tok->mdtl,
-            mechanism, tobj);
+    sign_opdata *opdata = sign_opdata_new();
     if (!opdata) {
         tpm_opdata_free(&tpm_opdata);
         return CKR_HOST_MEMORY;
@@ -243,18 +208,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
         return CKR_HOST_MEMORY;
     }
 
-    /* Use SW Verify if it's an asymmetric key with pkey set */
-    if (op != operation_sign && opdata->pkey) {
-        opdata->crypto_opdata->use_sw = true;
-        rv = sw_encrypt_data_init(tok->mdtl,
-                mechanism, tobj, &opdata->crypto_opdata->cryptopdata.sw_enc_data);
-        if (rv != CKR_OK) {
-            sign_opdata_free(&opdata);
-            return rv;
-        }
-    } else {
-        opdata->crypto_opdata->cryptopdata.tpm_opdata = tpm_opdata;
-    }
+    opdata->crypto_opdata->cryptopdata.tpm_opdata = tpm_opdata;
 
     /*
      * Store everything for later
@@ -582,12 +536,8 @@ CK_RV verify_final (session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signature_
         data = (const CK_BYTE_PTR)opdata->buffer;
     }
 
-    if (opdata->pkey) {
-        rv = ssl_util_sig_verify(opdata->pkey, opdata->padding, opdata->md,
-            data, data_len, signature, signature_len);
-    } else {
-        rv = tpm_verify(opdata->crypto_opdata->cryptopdata.tpm_opdata, data, data_len, signature, signature_len);
-    }
+    rv = tpm_verify(opdata->crypto_opdata->cryptopdata.tpm_opdata,
+            hash, hash_len, signature, signature_len);
 
 out:
     assert(tobj);

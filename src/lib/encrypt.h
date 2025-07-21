@@ -26,11 +26,6 @@ struct encrypt_op_data {
     crypto_op_data cryptopdata;
 };
 
-struct sw_encrypt_data {
-    int padding;
-    EVP_PKEY *key;
-};
-
 encrypt_op_data *encrypt_op_data_new(tobject *tobj);
 void encrypt_op_data_free(encrypt_op_data **opdata);
 

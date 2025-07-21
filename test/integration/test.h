@@ -18,9 +18,9 @@
 #include <cmocka.h>
 #include <tss2/tss2_sys.h>
 
-#include "ssl_util.h"
+#include "openssl_compat.h"
 #include "pkcs11.h"
-#include "ssl_util.h"
+#include "openssl_compat.h"
 #include "utils.h"
 
 /* 4 in db tokens + 1 uninitialized token */

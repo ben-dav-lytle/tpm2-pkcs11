@@ -12,18 +12,24 @@
 #include "log.h"
 #include "mech.h"
 #include "session.h"
+#include "ssl_util.h"
 #include "session_ctx.h"
 #include "sign.h"
 #include "token.h"
 #include "tpm.h"
 
 typedef struct sign_opdata sign_opdata;
+
 struct sign_opdata {
     CK_MECHANISM mech;
     bool do_hash;
     twist buffer;
     digest_op_data *digest_opdata;
     encrypt_op_data *crypto_opdata;
+
+    int padding;
+    EVP_PKEY *pkey;
+    const EVP_MD *md;
 };
 
 static sign_opdata *sign_opdata_new(mdetail *mdtl, CK_MECHANISM_PTR mechanism, tobject *tobj) {
@@ -75,6 +81,8 @@ static sign_opdata *sign_opdata_new(mdetail *mdtl, CK_MECHANISM_PTR mechanism, t
         return NULL;
     }
 
+
+
     opdata->padding = padding;
     opdata->pkey = pkey;
     opdata->md = md;
@@ -97,43 +105,43 @@ static void sign_opdata_free(sign_opdata **opdata) {
     *opdata = NULL;
 }
 
-static CK_RV update_pss_sig_state(token *tok, tobject *tobj) {
+// static CK_RV update_pss_sig_state(token *tok, tobject *tobj) {
 
-    CK_RV rv = CKR_GENERAL_ERROR;
+//     CK_RV rv = CKR_GENERAL_ERROR;
 
-    /*
-     * Only test for PSS signature state if it's an RSA object. This avoids printing superfluous errors
-     */
-    CK_OBJECT_CLASS cka_class = attr_list_get_CKA_CLASS(tobj->attrs, CK_OBJECT_CLASS_BAD);
-    if (cka_class != CKK_RSA) {
-        return CKR_OK;
-    }
+//     /*
+//      * Only test for PSS signature state if it's an RSA object. This avoids printing superfluous errors
+//      */
+//     CK_OBJECT_CLASS cka_class = attr_list_get_CKA_CLASS(tobj->attrs, CK_OBJECT_CLASS_BAD);
+//     if (cka_class != CKK_RSA) {
+//         return CKR_OK;
+//     }
 
-    /*
-     * Tokens added in previous versions may not have a known PSS signature
-     * state, so check and populate here.
-     */
-    bool pss_sigs_good = false;
-    pss_config_state pss_cfg = tok->config.pss_sigs_good;
-    if (pss_cfg == pss_config_state_unk) {
-        rv = tpm_get_pss_sig_state(tok->tctx, tobj,
-                &pss_sigs_good);
-        if (rv != CKR_OK) {
-            LOGW("Could not determine PSS signature format,"
-                    "assuming maximized slen");
-            tok->config.pss_sigs_good = pss_sigs_good ?
-                    pss_config_state_good : pss_config_state_bad;
-        }
+//     /*
+//      * Tokens added in previous versions may not have a known PSS signature
+//      * state, so check and populate here.
+//      */
+//     bool pss_sigs_good = false;
+//     pss_config_state pss_cfg = tok->config.pss_sigs_good;
+//     if (pss_cfg == pss_config_state_unk) {
+//         rv = tpm_get_pss_sig_state(tok->tctx, tobj,
+//                 &pss_sigs_good);
+//         if (rv != CKR_OK) {
+//             LOGW("Could not determine PSS signature format,"
+//                     "assuming maximized slen");
+//             tok->config.pss_sigs_good = pss_sigs_good ?
+//                     pss_config_state_good : pss_config_state_bad;
+//         }
 
-        mdetail_set_pss_status(tok->mdtl, pss_sigs_good);
-        rv = backend_update_token_config(tok);
-        if (rv != CKR_OK) {
-            LOGW("Could not update token config backend, moving on");
-        }
-    }
+//         mdetail_set_pss_status(tok->mdtl, pss_sigs_good);
+//         rv = backend_update_token_config(tok);
+//         if (rv != CKR_OK) {
+//             LOGW("Could not update token config backend, moving on");
+//         }
+//     }
 
-    return rv;
-}
+//     return rv;
+// }
 
 static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
 
@@ -186,13 +194,14 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
     }
 
     tpm_op_data *tpm_opdata;
-    rv = mech_get_tpm_opdata(tok->tctx, mechanism, tobj, &tpm_opdata);
+    rv = mech_get_tpm_opdata(tok->mdtl, tok->tctx, mechanism, tobj, &tpm_opdata);
     if (rv != CKR_OK) {
         tpm_opdata_free(&tpm_opdata);
         return rv;
     }
 
-    sign_opdata *opdata = sign_opdata_new();
+    sign_opdata *opdata = sign_opdata_new(tok->mdtl,
+            mechanism, tobj);
     if (!opdata) {
         tpm_opdata_free(&tpm_opdata);
         return CKR_HOST_MEMORY;
@@ -537,7 +546,7 @@ CK_RV verify_final (session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signature_
     }
 
     rv = tpm_verify(opdata->crypto_opdata->cryptopdata.tpm_opdata,
-            hash, hash_len, signature, signature_len);
+            data, data_len, signature, signature_len);
 
 out:
     assert(tobj);

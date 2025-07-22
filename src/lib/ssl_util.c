@@ -12,6 +12,7 @@
 #include "attrs.h"
 #include "log.h"
 #include "ssl_util.h"
+#include <string.h>
 #include "twist.h"
 
 #if defined(LIB_TPM2_OPENSSL_OPENSSL_POST111)
@@ -424,6 +425,7 @@ CK_RV ssl_util_decrypt(EVP_PKEY *pkey,
     assert(pkey);
 
     CK_RV rv = CKR_GENERAL_ERROR;
+    unsigned char *buffer = NULL;
 
     int to_len = EVP_PKEY_size(pkey);
     if (to_len <= 0) {
@@ -451,7 +453,7 @@ CK_RV ssl_util_decrypt(EVP_PKEY *pkey,
         }
     }
 
-    unsigned char *buffer = calloc(1, to_len);
+    buffer = calloc(1, to_len);
     if (!buffer) {
         LOGE("oom");
         rv = CKR_HOST_MEMORY;

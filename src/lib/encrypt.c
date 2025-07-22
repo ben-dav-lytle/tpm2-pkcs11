@@ -9,7 +9,7 @@
 #include "checks.h"
 #include "encrypt.h"
 #include "mech.h"
-#include "openssl_compat.h"
+#include "ssl_util.h"
 #include "session.h"
 #include "session_ctx.h"
 #include "token.h"
@@ -76,18 +76,28 @@ void encrypt_op_data_free(encrypt_op_data **opdata) {
     }
 }
 
-CK_RV sw_encrypt_data_init(mdetail *mdtl, CK_MECHANISM *mechanism, tobject *tobj, sw_encrypt_data **enc_data) {
+CK_RV sw_encrypt_data_init(CK_MECHANISM *mechanism, tobject *tobj, sw_encrypt_data **enc_data) {
+    BIGNUM *e = NULL;
+    BIGNUM *n = NULL;
+    RSA *r = NULL;
 
-    EVP_PKEY *pkey = NULL;
-    CK_RV rv = ssl_util_attrs_to_evp(tobj->attrs, &pkey);
-    if (rv != CKR_OK) {
-        return rv;
+    CK_RV rv = CKR_GENERAL_ERROR;
+
+    /* we only support one mechanism via this path right now */
+    if (mechanism->mechanism != CKM_RSA_PKCS) {
+        LOGE("Cannot synthesize mechanism for key");
+        return CKR_MECHANISM_INVALID;
     }
 
-    int padding = 0;
-    rv = mech_get_padding(mdtl, mechanism, &padding);
-    if (rv != CKR_OK) {
-        return rv;
+    /*
+     * We know this in RSA key since we checked the mechanism,
+     * create the OSSL key
+     */
+    r = RSA_new();
+    if (!r) {
+        LOGE("oom");
+        rv = CKR_HOST_MEMORY;
+        goto error;
     }
 
     CK_ATTRIBUTE_PTR a = attr_get_attribute_by_type(tobj->attrs, CKA_MODULUS);
@@ -287,7 +297,7 @@ static CK_RV common_init_op (session_ctx *ctx, encrypt_op_data *supplied_opdata,
      * only object and don't go to the TPM.
      */
     if (tobj->pub) {
-        rv = mech_get_tpm_opdata(tok->tctx, mechanism, tobj,
+        rv = mech_get_tpm_opdata(tok->mdtl, tok->tctx, mechanism, tobj,
                 &opdata->cryptopdata.tpm_opdata);
     } else {
         opdata->use_sw = true;
@@ -347,6 +357,8 @@ static CK_RV common_update_op (session_ctx *ctx, encrypt_op_data *supplied_opdat
 
     rv = fop(&opdata->cryptopdata, opdata->clazz, part, part_len,
             encrypted_part, encrypted_part_len);
+
+    return rv;
 }
 
 static CK_RV common_final_op(session_ctx *ctx, encrypt_op_data *supplied_opdata, operation op,

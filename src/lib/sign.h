@@ -5,6 +5,7 @@
 
 #include "pkcs11.h"
 #include "session_ctx.h"
+#include "ssl_util.h"
 
 CK_RV sign_init(session_ctx *ctx, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key);
 
